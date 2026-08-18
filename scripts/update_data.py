@@ -1,72 +1,1165 @@
 #!/usr/bin/env python3
-from urllib.request import Request,urlopen
-from datetime import date,datetime,timedelta,timezone
+
+from urllib.request import Request, urlopen
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-import csv,io,json,math,statistics
-ROOT=Path(__file__).resolve().parents[1];OUT=ROOT/'data'/'dashboard.json';FRED='https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}'
-ECON={'M2SL':('Money & Liquidity','M2 money stock',15,'growth',24),'TOTBKCR':('Bank Credit','Total bank credit',10,'growth',9),'BUSLOANS':('Business Lending','Commercial & industrial loans',5,'growth',9),'CPATAX':('Corporate Health','Corporate profits after tax',15,'growth',65),'INDPRO':('Real Economic Activity','Industrial production',15,'growth',18),'PAYEMS':('Employment','Total nonfarm payrolls',10,'growth',8),'RSAFS':('Consumer Activity','Retail & food services sales',5,'growth',17),'DSPIC96':('Consumer Income','Real disposable personal income',5,'growth',32),'CPIAUCSL':('Inflation Environment','CPI inflation',10,'inflation',15),'DGORDER':('Business Investment','Durable goods new orders',5,'growth',28),'FEDFUNDS':('Monetary Policy','Effective federal funds rate',5,'policy',2)}
-SENT={'VIXCLS':('Implied Volatility','CBOE VIX',30,'inverse'),'BAMLH0A0HYM2':('Risk Appetite','High-yield option-adjusted spread',25,'inverse'),'STLFSI4':('Financial Stress','St. Louis Fed Financial Stress Index',20,'inverse'),'SP500':('Market Momentum','S&P 500 short-term momentum',15,'momentum'),'NASDAQCOM':('Growth-Risk Appetite','NASDAQ short-term momentum',10,'momentum')}
+import csv
+import io
+import json
+import math
+import statistics
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "data" / "dashboard.json"
+
+FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+
+
+# ---------------------------------------------------------
+# ECONOMIC MODEL
+# ---------------------------------------------------------
+#
+# This model deliberately excludes:
+# - Stock prices
+# - VIX
+# - Technical indicators
+# - Investor sentiment
+# - Market breadth
+# - Options positioning
+# - Fund flows
+# - Treasury-market pricing
+#
+# Weights are fixed and are NOT optimized against stock returns.
+#
+
+ECON = {
+    "M2SL": (
+        "Money & Liquidity",
+        "M2 money stock",
+        15,
+        "growth",
+        24,
+    ),
+    "TOTBKCR": (
+        "Bank Credit",
+        "Total bank credit",
+        10,
+        "growth",
+        9,
+    ),
+    "BUSLOANS": (
+        "Business Lending",
+        "Commercial & industrial loans",
+        5,
+        "growth",
+        9,
+    ),
+    "CPATAX": (
+        "Corporate Health",
+        "Corporate profits after tax",
+        15,
+        "growth",
+        65,
+    ),
+    "INDPRO": (
+        "Real Economic Activity",
+        "Industrial production",
+        15,
+        "growth",
+        18,
+    ),
+    "PAYEMS": (
+        "Employment",
+        "Total nonfarm payrolls",
+        10,
+        "growth",
+        8,
+    ),
+    "RSAFS": (
+        "Consumer Activity",
+        "Retail & food services sales",
+        5,
+        "growth",
+        17,
+    ),
+    "DSPIC96": (
+        "Consumer Income",
+        "Real disposable personal income",
+        5,
+        "growth",
+        32,
+    ),
+    "CPIAUCSL": (
+        "Inflation Environment",
+        "CPI inflation",
+        10,
+        "inflation",
+        15,
+    ),
+    "DGORDER": (
+        "Business Investment",
+        "Durable goods new orders",
+        5,
+        "growth",
+        28,
+    ),
+    "FEDFUNDS": (
+        "Monetary Policy",
+        "Effective federal funds rate",
+        5,
+        "policy",
+        2,
+    ),
+}
+
+
+# ---------------------------------------------------------
+# SENTIMENT MODEL
+# ---------------------------------------------------------
+#
+# This model is intentionally separate from the economic model.
+#
+# Market-derived information is allowed HERE, but nowhere in the
+# economic model.
+#
+
+SENT = {
+    "VIXCLS": (
+        "Implied Volatility",
+        "CBOE VIX",
+        30,
+        "inverse_level",
+    ),
+    "BAMLH0A0HYM2": (
+        "Risk Appetite",
+        "High-yield option-adjusted spread",
+        25,
+        "inverse_level",
+    ),
+    "STLFSI4": (
+        "Financial Stress",
+        "St. Louis Fed Financial Stress Index",
+        20,
+        "inverse_level",
+    ),
+    "SP500": (
+        "Market Momentum",
+        "S&P 500 short-term momentum",
+        15,
+        "momentum",
+    ),
+    "NASDAQCOM": (
+        "Growth-Risk Appetite",
+        "NASDAQ short-term momentum",
+        10,
+        "momentum",
+    ),
+}
+
+
+# ---------------------------------------------------------
+# DATA DOWNLOAD
+# ---------------------------------------------------------
+
+
 def fetch(sid):
- raw=urlopen(Request(FRED.format(sid=sid),headers={'User-Agent':'MarketConditionsDashboard/1.0'}),timeout=30).read().decode('utf-8-sig');rd=csv.DictReader(io.StringIO(raw));col=[c for c in rd.fieldnames if c!='observation_date'][0];o=[]
- for r in rd:
-  try:
-   if r[col] and r[col]!='.':o.append((date.fromisoformat(r['observation_date']),float(r[col])))
-  except:pass
- return sorted(o)
-def last(rows,d):
- x=None
- for item in rows:
-  if item[0]<=d:x=item
-  else:break
- return x
-def clamp(x,a,b):return max(a,min(b,x))
-def logistic(z):return 100/(1+math.exp(-1.12*clamp(z,-4,4)))
-def robust(v):
- v=[x for x in v if x is not None and math.isfinite(x)]
- if len(v)<8:return 0,1
- m=statistics.median(v);mad=statistics.median(abs(x-m) for x in v);return m,max(1.4826*mad,statistics.pstdev(v) or 1,1e-6)
-def yoy(rows,item):
- if not item:return None
- p=last(rows,item[0]-timedelta(days=365));return None if not p or p[1]==0 else (item[1]/p[1]-1)*100
-def econ_comp(sid,asof,rows):
- name,detail,w,kind,lag=ECON[sid];cur=last(rows,asof-timedelta(days=lag));prev=last(rows,asof-timedelta(days=lag+92))
- if not cur:return None
- if kind=='growth':
-  g,pg=yoy(rows,cur),yoy(rows,prev);hist=[yoy(rows,i) for i in rows if asof-timedelta(days=3650)<=i[0]<=cur[0]];med,sc=robust(hist);level=logistic(((g if g is not None else med)-med)/max(sc,.25));acc=50 if g is None or pg is None else logistic((g-pg)/max(sc*.5,.35));score=.68*level+.32*acc;eps=max(sc*.12,.15);direction='→' if g is None or pg is None or abs(g-pg)<=eps else ('↑' if g>pg else '↓')
- elif kind=='inflation':
-  g,pg=yoy(rows,cur),yoy(rows,prev)
-  if g is None:return None
-  dist=abs(g-2);level=100-clamp(dist/5*100,0,100);old=abs((pg if pg is not None else g)-2);score=.72*level+.28*logistic((old-dist)/.45);direction='↑' if dist<old-.08 else '↓' if dist>old+.08 else '→'
- else:
-  rate=cur[1];pr=prev[1] if prev else rate;score=.7*logistic((2.5-rate)/1.8)+.3*logistic((pr-rate)/.65);direction='↑' if rate<pr-.1 else '↓' if rate>pr+.1 else '→'
- return {'name':name,'detail':detail,'weight':w,'score':round(clamp(score,0,100),1),'direction':direction}
-def aggregate(asof,defs,series,compfn):
- parts=[];n=d=0
- for sid in defs:
-  c=compfn(sid,asof,series[sid])
-  if c:parts.append(c);n+=c['score']*c['weight'];d+=c['weight']
- return (n/d if d else None),parts
-def sent_comp(sid,asof,rows):
- name,detail,w,kind=SENT[sid];cur=last(rows,asof)
- if not cur:return None
- if kind=='momentum':
-  p21=last(rows,asof-timedelta(days=30));p5=last(rows,asof-timedelta(days=7))
-  if not p21:return None
-  r21=(cur[1]/p21[1]-1)*100;r5=(cur[1]/p5[1]-1)*100 if p5 else r21;score=logistic((.7*r21+.3*r5)/4);direction='↑' if r5>1 else '↓' if r5<-1 else '→'
- else:
-  vals=[v for d,v in rows if asof-timedelta(days=3650)<=d<=asof];med,sc=robust(vals);score=100-logistic((cur[1]-med)/max(sc,.01));p=last(rows,asof-timedelta(days=30));delta=0 if not p else cur[1]-p[1];eps=max(sc*.08,.02);direction='↑' if delta<-eps else '↓' if delta>eps else '→'
- return {'name':name,'detail':detail,'weight':w,'score':round(clamp(score,0,100),1),'direction':direction}
-def eclass(x):
- return 'Exceptional' if x>=80 else 'Favorable' if x>=65 else 'Moderately Favorable' if x>=55 else 'Neutral' if x>=45 else 'Moderately Unfavorable' if x>=35 else 'Unfavorable' if x>=20 else 'Severe'
-def direc(a,b,eps=1.5):return '↑' if a>b+eps else '↓' if a<b-eps else '→'
+    """
+    Download one FRED series.
+
+    Uses:
+    - 120-second timeout
+    - up to 3 attempts
+    - 5-second pause between failures
+
+    This is intentionally more tolerant of slow FRED responses
+    when running inside GitHub Actions.
+    """
+
+    url = FRED.format(sid=sid)
+
+    last_error = None
+
+    for attempt in range(1, 4):
+        try:
+            print(f"Downloading {sid} - attempt {attempt}/3")
+
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "MarketConditionsDashboard/1.0"
+                },
+            )
+
+            with urlopen(req, timeout=120) as response:
+                raw = response.read().decode("utf-8-sig")
+
+            reader = csv.DictReader(io.StringIO(raw))
+
+            if not reader.fieldnames:
+                raise ValueError(f"No columns returned for {sid}")
+
+            value_columns = [
+                c
+                for c in reader.fieldnames
+                if c != "observation_date"
+            ]
+
+            if not value_columns:
+                raise ValueError(
+                    f"No value column returned for {sid}"
+                )
+
+            value_column = value_columns[0]
+
+            output = []
+
+            for row in reader:
+                try:
+                    value_text = row[value_column].strip()
+
+                    if not value_text or value_text == ".":
+                        continue
+
+                    observation_date = date.fromisoformat(
+                        row["observation_date"]
+                    )
+
+                    value = float(value_text)
+
+                    output.append(
+                        (
+                            observation_date,
+                            value,
+                        )
+                    )
+
+                except Exception:
+                    continue
+
+            output.sort()
+
+            if not output:
+                raise ValueError(
+                    f"No usable observations returned for {sid}"
+                )
+
+            print(
+                f"Downloaded {sid}: "
+                f"{len(output)} observations"
+            )
+
+            return output
+
+        except Exception as error:
+            last_error = error
+
+            print(
+                f"Attempt {attempt} failed for {sid}: "
+                f"{error}"
+            )
+
+            if attempt < 3:
+                print("Waiting 5 seconds before retry...")
+                time.sleep(5)
+
+    raise RuntimeError(
+        f"Failed to download {sid} after 3 attempts"
+    ) from last_error
+
+
+# ---------------------------------------------------------
+# GENERAL HELPERS
+# ---------------------------------------------------------
+
+
+def last_before(rows, target_date):
+    """
+    Return the latest observation on or before target_date.
+    """
+
+    lo = 0
+    hi = len(rows)
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+
+        if rows[mid][0] <= target_date:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    if lo == 0:
+        return None
+
+    return rows[lo - 1]
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def logistic(z):
+    """
+    Convert standardized values to a smooth 0-100 score.
+    """
+
+    z = clamp(z, -4, 4)
+
+    return 100 / (
+        1 + math.exp(-1.12 * z)
+    )
+
+
+def robust(values):
+    """
+    Robust center and scale based primarily on median and MAD.
+    """
+
+    values = [
+        value
+        for value in values
+        if value is not None
+        and math.isfinite(value)
+    ]
+
+    if len(values) < 8:
+        return 0, 1
+
+    median = statistics.median(values)
+
+    mad = statistics.median(
+        abs(value - median)
+        for value in values
+    )
+
+    scale = 1.4826 * mad
+
+    if scale < 1e-6:
+        scale = statistics.pstdev(values) or 1
+
+    return median, max(scale, 1e-6)
+
+
+def yoy(rows, item):
+    """
+    Approximate year-over-year percentage change.
+    """
+
+    if not item:
+        return None
+
+    previous = last_before(
+        rows,
+        item[0] - timedelta(days=365),
+    )
+
+    if not previous:
+        return None
+
+    if previous[1] == 0:
+        return None
+
+    return (
+        item[1] / previous[1] - 1
+    ) * 100
+
+
+# ---------------------------------------------------------
+# ECONOMIC MODEL
+# ---------------------------------------------------------
+
+
+def econ_component(
+    sid,
+    asof,
+    rows,
+):
+    name, detail, weight, kind, lag_days = ECON[sid]
+
+    current = last_before(
+        rows,
+        asof - timedelta(days=lag_days),
+    )
+
+    previous = last_before(
+        rows,
+        asof - timedelta(
+            days=lag_days + 92
+        ),
+    )
+
+    if not current:
+        return None
+
+    # ---------------------------------------------
+    # NORMAL GROWTH SERIES
+    # ---------------------------------------------
+
+    if kind == "growth":
+        current_growth = yoy(
+            rows,
+            current,
+        )
+
+        previous_growth = yoy(
+            rows,
+            previous,
+        )
+
+        historical_growth = []
+
+        history_start = (
+            asof - timedelta(days=3650)
+        )
+
+        for item in rows:
+            if (
+                history_start
+                <= item[0]
+                <= current[0]
+            ):
+                growth = yoy(
+                    rows,
+                    item,
+                )
+
+                if growth is not None:
+                    historical_growth.append(
+                        growth
+                    )
+
+        median, scale = robust(
+            historical_growth
+        )
+
+        if current_growth is None:
+            current_growth = median
+
+        level_score = logistic(
+            (
+                current_growth - median
+            )
+            / max(scale, 0.25)
+        )
+
+        if previous_growth is None:
+            acceleration_score = 50
+
+        else:
+            acceleration_score = logistic(
+                (
+                    current_growth
+                    - previous_growth
+                )
+                / max(
+                    scale * 0.5,
+                    0.35,
+                )
+            )
+
+        score = (
+            0.68 * level_score
+            + 0.32 * acceleration_score
+        )
+
+        epsilon = max(
+            scale * 0.12,
+            0.15,
+        )
+
+        if previous_growth is None:
+            direction = "→"
+
+        elif (
+            current_growth
+            > previous_growth + epsilon
+        ):
+            direction = "↑"
+
+        elif (
+            current_growth
+            < previous_growth - epsilon
+        ):
+            direction = "↓"
+
+        else:
+            direction = "→"
+
+    # ---------------------------------------------
+    # INFLATION SERIES
+    # ---------------------------------------------
+
+    elif kind == "inflation":
+        current_growth = yoy(
+            rows,
+            current,
+        )
+
+        previous_growth = yoy(
+            rows,
+            previous,
+        )
+
+        if current_growth is None:
+            return None
+
+        current_distance = abs(
+            current_growth - 2
+        )
+
+        level_score = (
+            100
+            - clamp(
+                current_distance / 5 * 100,
+                0,
+                100,
+            )
+        )
+
+        if previous_growth is None:
+            direction_score = 50
+            direction = "→"
+
+        else:
+            previous_distance = abs(
+                previous_growth - 2
+            )
+
+            improvement = (
+                previous_distance
+                - current_distance
+            )
+
+            direction_score = logistic(
+                improvement / 0.45
+            )
+
+            if (
+                current_distance
+                < previous_distance - 0.08
+            ):
+                direction = "↑"
+
+            elif (
+                current_distance
+                > previous_distance + 0.08
+            ):
+                direction = "↓"
+
+            else:
+                direction = "→"
+
+        score = (
+            0.72 * level_score
+            + 0.28 * direction_score
+        )
+
+    # ---------------------------------------------
+    # FEDERAL FUNDS POLICY RATE
+    # ---------------------------------------------
+
+    elif kind == "policy":
+        rate = current[1]
+
+        if previous:
+            previous_rate = previous[1]
+        else:
+            previous_rate = rate
+
+        level_score = logistic(
+            (2.5 - rate) / 1.8
+        )
+
+        direction_score = logistic(
+            (
+                previous_rate - rate
+            )
+            / 0.65
+        )
+
+        score = (
+            0.70 * level_score
+            + 0.30 * direction_score
+        )
+
+        if rate < previous_rate - 0.10:
+            direction = "↑"
+
+        elif rate > previous_rate + 0.10:
+            direction = "↓"
+
+        else:
+            direction = "→"
+
+    else:
+        return None
+
+    return {
+        "name": name,
+        "detail": detail,
+        "weight": weight,
+        "score": round(
+            clamp(score, 0, 100),
+            1,
+        ),
+        "direction": direction,
+    }
+
+
+def econ_score(
+    asof,
+    series,
+):
+    parts = []
+
+    numerator = 0
+    denominator = 0
+
+    for sid in ECON:
+        component = econ_component(
+            sid,
+            asof,
+            series[sid],
+        )
+
+        if component:
+            parts.append(component)
+
+            numerator += (
+                component["score"]
+                * component["weight"]
+            )
+
+            denominator += (
+                component["weight"]
+            )
+
+    if not denominator:
+        return None, []
+
+    return (
+        numerator / denominator,
+        parts,
+    )
+
+
+# ---------------------------------------------------------
+# SENTIMENT MODEL
+# ---------------------------------------------------------
+
+
+def window_values(
+    rows,
+    asof,
+    days=3650,
+):
+    start = (
+        asof - timedelta(days=days)
+    )
+
+    return [
+        value
+        for observation_date, value in rows
+        if start
+        <= observation_date
+        <= asof
+    ]
+
+
+def sent_component(
+    sid,
+    asof,
+    rows,
+):
+    name, detail, weight, kind = SENT[sid]
+
+    current = last_before(
+        rows,
+        asof,
+    )
+
+    if not current:
+        return None
+
+    # ---------------------------------------------
+    # MARKET MOMENTUM
+    # ---------------------------------------------
+
+    if kind == "momentum":
+        one_month_ago = last_before(
+            rows,
+            asof - timedelta(days=30),
+        )
+
+        one_week_ago = last_before(
+            rows,
+            asof - timedelta(days=7),
+        )
+
+        if not one_month_ago:
+            return None
+
+        return_1m = (
+            current[1]
+            / one_month_ago[1]
+            - 1
+        ) * 100
+
+        if one_week_ago:
+            return_1w = (
+                current[1]
+                / one_week_ago[1]
+                - 1
+            ) * 100
+
+        else:
+            return_1w = return_1m
+
+        combined_momentum = (
+            0.7 * return_1m
+            + 0.3 * return_1w
+        )
+
+        score = logistic(
+            combined_momentum / 4
+        )
+
+        if return_1w > 1:
+            direction = "↑"
+
+        elif return_1w < -1:
+            direction = "↓"
+
+        else:
+            direction = "→"
+
+    # ---------------------------------------------
+    # FEAR / STRESS MEASURES
+    # ---------------------------------------------
+
+    else:
+        values = window_values(
+            rows,
+            asof,
+        )
+
+        median, scale = robust(
+            values
+        )
+
+        z = (
+            current[1] - median
+        ) / max(
+            scale,
+            0.01,
+        )
+
+        # Higher VIX/spreads/stress = worse sentiment.
+        score = 100 - logistic(z)
+
+        one_month_ago = last_before(
+            rows,
+            asof - timedelta(days=30),
+        )
+
+        if not one_month_ago:
+            direction = "→"
+
+        else:
+            delta = (
+                current[1]
+                - one_month_ago[1]
+            )
+
+            epsilon = max(
+                scale * 0.08,
+                0.02,
+            )
+
+            if delta < -epsilon:
+                direction = "↑"
+
+            elif delta > epsilon:
+                direction = "↓"
+
+            else:
+                direction = "→"
+
+    return {
+        "name": name,
+        "detail": detail,
+        "weight": weight,
+        "score": round(
+            clamp(score, 0, 100),
+            1,
+        ),
+        "direction": direction,
+    }
+
+
+def sent_score(
+    asof,
+    series,
+):
+    parts = []
+
+    numerator = 0
+    denominator = 0
+
+    for sid in SENT:
+        component = sent_component(
+            sid,
+            asof,
+            series[sid],
+        )
+
+        if component:
+            parts.append(component)
+
+            numerator += (
+                component["score"]
+                * component["weight"]
+            )
+
+            denominator += (
+                component["weight"]
+            )
+
+    if not denominator:
+        return None, []
+
+    return (
+        numerator / denominator,
+        parts,
+    )
+
+
+# ---------------------------------------------------------
+# LABELS
+# ---------------------------------------------------------
+
+
+def econ_class(score):
+    if score >= 80:
+        return "Exceptional"
+
+    if score >= 65:
+        return "Favorable"
+
+    if score >= 55:
+        return "Moderately Favorable"
+
+    if score >= 45:
+        return "Neutral"
+
+    if score >= 35:
+        return "Moderately Unfavorable"
+
+    if score >= 20:
+        return "Unfavorable"
+
+    return "Severe"
+
+
+def direction(
+    current,
+    previous,
+    epsilon=1.5,
+):
+    if current > previous + epsilon:
+        return "↑"
+
+    if current < previous - epsilon:
+        return "↓"
+
+    return "→"
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+
 def main():
- ids=set(ECON)|set(SENT);series={s:fetch(s) for s in ids};today=date.today();start=today-timedelta(days=int(365.25*10));hist=[];d=start
- while d<=today:
-  if d.weekday()<5:
-   e,_=aggregate(d,ECON,series,econ_comp);s,_=aggregate(d,SENT,series,sent_comp);sp=last(series['SP500'],d)
-   if e is not None and s is not None:hist.append({'date':d.isoformat(),'economic':round(e,1),'sentiment':round(s,1),'sp500':None if not sp else round(sp[1],2)})
-  d+=timedelta(days=1)
- e,ep=aggregate(today,ECON,series,econ_comp);e3,_=aggregate(today-timedelta(days=92),ECON,series,econ_comp);s,sparts=aggregate(today,SENT,series,sent_comp);s1,_=aggregate(today-timedelta(days=30),SENT,series,sent_comp);sp=last(series['SP500'],today);sp1=last(series['SP500'],today-timedelta(days=30));chg=None if not sp or not sp1 else (sp[1]/sp1[1]-1)*100
- payload={'generated_at':datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'current':{'economic':{'score':round(e,1),'classification':eclass(e),'direction':direc(e,e3),'change_3m':round(e-e3,1),'components':ep},'sentiment':{'score':round(s,1),'direction':direc(s,s1),'change_1m':round(s-s1,1),'components':sparts},'sp500':{'value':None if not sp else round(sp[1],2),'change_1m':None if chg is None else round(chg,2)}},'history':hist,'meta':{'history_years':10,'economic_model_uses_market_data':False,'sentiment_model_is_separate':True,'sp500_is_display_only':True}}
- OUT.write_text(json.dumps(payload,separators=(',',':')));print('Wrote',OUT,len(hist),'rows')
-if __name__=='__main__':main()
+    ids = set(ECON) | set(SENT)
+
+    series = {}
+
+    print("")
+    print("========================================")
+    print("Downloading FRED data")
+    print("========================================")
+
+    for sid in sorted(ids):
+        series[sid] = fetch(sid)
+
+    today = date.today()
+
+    start = (
+        today
+        - timedelta(
+            days=int(
+                365.25 * 10
+            )
+        )
+    )
+
+    print("")
+    print("========================================")
+    print("Building 10-year history")
+    print("========================================")
+
+    history = []
+
+    current_date = start
+
+    while current_date <= today:
+        if current_date.weekday() < 5:
+
+            economic_score, _ = econ_score(
+                current_date,
+                series,
+            )
+
+            sentiment_score, _ = sent_score(
+                current_date,
+                series,
+            )
+
+            sp500 = last_before(
+                series["SP500"],
+                current_date,
+            )
+
+            if (
+                economic_score is not None
+                and sentiment_score is not None
+            ):
+                history.append(
+                    {
+                        "date":
+                            current_date.isoformat(),
+
+                        "economic":
+                            round(
+                                economic_score,
+                                1,
+                            ),
+
+                        "sentiment":
+                            round(
+                                sentiment_score,
+                                1,
+                            ),
+
+                        "sp500":
+                            (
+                                None
+                                if not sp500
+                                else round(
+                                    sp500[1],
+                                    2,
+                                )
+                            ),
+                    }
+                )
+
+        current_date += timedelta(days=1)
+
+    print(
+        f"Built {len(history)} "
+        f"historical observations"
+    )
+
+    # -------------------------------------------------
+    # CURRENT ECONOMIC SCORE
+    # -------------------------------------------------
+
+    economic_score, economic_parts = econ_score(
+        today,
+        series,
+    )
+
+    economic_3m, _ = econ_score(
+        today - timedelta(days=92),
+        series,
+    )
+
+    # -------------------------------------------------
+    # CURRENT SENTIMENT SCORE
+    # -------------------------------------------------
+
+    sentiment_score, sentiment_parts = sent_score(
+        today,
+        series,
+    )
+
+    sentiment_1m, _ = sent_score(
+        today - timedelta(days=30),
+        series,
+    )
+
+    # -------------------------------------------------
+    # CURRENT S&P VALUE
+    # -------------------------------------------------
+
+    sp500_current = last_before(
+        series["SP500"],
+        today,
+    )
+
+    sp500_1m = last_before(
+        series["SP500"],
+        today - timedelta(days=30),
+    )
+
+    if (
+        sp500_current
+        and sp500_1m
+    ):
+        sp500_change = (
+            sp500_current[1]
+            / sp500_1m[1]
+            - 1
+        ) * 100
+
+    else:
+        sp500_change = None
+
+    # -------------------------------------------------
+    # JSON PAYLOAD
+    # -------------------------------------------------
+
+    payload = {
+        "generated_at":
+            datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            ),
+
+        "current": {
+            "economic": {
+                "score":
+                    round(
+                        economic_score,
+                        1,
+                    ),
+
+                "classification":
+                    econ_class(
+                        economic_score
+                    ),
+
+                "direction":
+                    direction(
+                        economic_score,
+                        economic_3m,
+                    ),
+
+                "change_3m":
+                    round(
+                        economic_score
+                        - economic_3m,
+                        1,
+                    ),
+
+                "components":
+                    economic_parts,
+            },
+
+            "sentiment": {
+                "score":
+                    round(
+                        sentiment_score,
+                        1,
+                    ),
+
+                "direction":
+                    direction(
+                        sentiment_score,
+                        sentiment_1m,
+                    ),
+
+                "change_1m":
+                    round(
+                        sentiment_score
+                        - sentiment_1m,
+                        1,
+                    ),
+
+                "components":
+                    sentiment_parts,
+            },
+
+            "sp500": {
+                "value":
+                    (
+                        None
+                        if not sp500_current
+                        else round(
+                            sp500_current[1],
+                            2,
+                        )
+                    ),
+
+                "change_1m":
+                    (
+                        None
+                        if sp500_change is None
+                        else round(
+                            sp500_change,
+                            2,
+                        )
+                    ),
+            },
+        },
+
+        "history":
+            history,
+
+        "meta": {
+            "history_years": 10,
+
+            "economic_model_uses_market_data":
+                False,
+
+            "sentiment_model_is_separate":
+                True,
+
+            "sp500_is_display_only":
+                True,
+        },
+    }
+
+    OUT.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    OUT.write_text(
+        json.dumps(
+            payload,
+            separators=(",", ":"),
+        )
+    )
+
+    print("")
+    print("========================================")
+    print("Dashboard data generated successfully")
+    print("========================================")
+    print(f"Output: {OUT}")
+    print(
+        f"Economic score: "
+        f"{economic_score:.1f}"
+    )
+    print(
+        f"Sentiment score: "
+        f"{sentiment_score:.1f}"
+    )
+
+
+if __name__ == "__main__":
+    main()
