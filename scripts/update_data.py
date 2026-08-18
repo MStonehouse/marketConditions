@@ -1,37 +1,32 @@
 #!/usr/bin/env python3
 
-from urllib.request import Request, urlopen
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
-import csv
-import io
+import os
 import json
 import math
-import statistics
 import time
+import statistics
+
+from pathlib import Path
+from datetime import date, datetime, timedelta, timezone
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
 
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "data" / "dashboard.json"
 
-FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+FRED_API_URL = (
+    "https://api.stlouisfed.org/fred/series/observations"
+)
+
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
 
-# ---------------------------------------------------------
-# ECONOMIC MODEL
-# ---------------------------------------------------------
+# =========================================================
+# ECONOMIC CONDITIONS MODEL
+# =========================================================
 #
-# This model deliberately excludes:
-# - Stock prices
-# - VIX
-# - Technical indicators
-# - Investor sentiment
-# - Market breadth
-# - Options positioning
-# - Fund flows
-# - Treasury-market pricing
-#
-# Weights are fixed and are NOT optimized against stock returns.
+# NO market-derived inputs are used in this model.
 #
 
 ECON = {
@@ -42,6 +37,7 @@ ECON = {
         "growth",
         24,
     ),
+
     "TOTBKCR": (
         "Bank Credit",
         "Total bank credit",
@@ -49,6 +45,7 @@ ECON = {
         "growth",
         9,
     ),
+
     "BUSLOANS": (
         "Business Lending",
         "Commercial & industrial loans",
@@ -56,6 +53,7 @@ ECON = {
         "growth",
         9,
     ),
+
     "CPATAX": (
         "Corporate Health",
         "Corporate profits after tax",
@@ -63,6 +61,7 @@ ECON = {
         "growth",
         65,
     ),
+
     "INDPRO": (
         "Real Economic Activity",
         "Industrial production",
@@ -70,6 +69,7 @@ ECON = {
         "growth",
         18,
     ),
+
     "PAYEMS": (
         "Employment",
         "Total nonfarm payrolls",
@@ -77,6 +77,7 @@ ECON = {
         "growth",
         8,
     ),
+
     "RSAFS": (
         "Consumer Activity",
         "Retail & food services sales",
@@ -84,6 +85,7 @@ ECON = {
         "growth",
         17,
     ),
+
     "DSPIC96": (
         "Consumer Income",
         "Real disposable personal income",
@@ -91,6 +93,7 @@ ECON = {
         "growth",
         32,
     ),
+
     "CPIAUCSL": (
         "Inflation Environment",
         "CPI inflation",
@@ -98,6 +101,7 @@ ECON = {
         "inflation",
         15,
     ),
+
     "DGORDER": (
         "Business Investment",
         "Durable goods new orders",
@@ -105,6 +109,7 @@ ECON = {
         "growth",
         28,
     ),
+
     "FEDFUNDS": (
         "Monetary Policy",
         "Effective federal funds rate",
@@ -115,14 +120,11 @@ ECON = {
 }
 
 
-# ---------------------------------------------------------
-# SENTIMENT MODEL
-# ---------------------------------------------------------
+# =========================================================
+# INVESTOR SENTIMENT MODEL
+# =========================================================
 #
-# This model is intentionally separate from the economic model.
-#
-# Market-derived information is allowed HERE, but nowhere in the
-# economic model.
+# This model is intentionally completely separate from ECON.
 #
 
 SENT = {
@@ -132,24 +134,28 @@ SENT = {
         30,
         "inverse_level",
     ),
+
     "BAMLH0A0HYM2": (
         "Risk Appetite",
         "High-yield option-adjusted spread",
         25,
         "inverse_level",
     ),
+
     "STLFSI4": (
         "Financial Stress",
         "St. Louis Fed Financial Stress Index",
         20,
         "inverse_level",
     ),
+
     "SP500": (
         "Market Momentum",
         "S&P 500 short-term momentum",
         15,
         "momentum",
     ),
+
     "NASDAQCOM": (
         "Growth-Risk Appetite",
         "NASDAQ short-term momentum",
@@ -159,134 +165,159 @@ SENT = {
 }
 
 
-# ---------------------------------------------------------
-# DATA DOWNLOAD
-# ---------------------------------------------------------
+# =========================================================
+# FRED API
+# =========================================================
 
 
 def fetch(sid):
-    """
-    Download one FRED series.
+    if not FRED_API_KEY:
+        raise RuntimeError(
+            "FRED_API_KEY environment variable is missing."
+        )
 
-    Uses:
-    - 120-second timeout
-    - up to 3 attempts
-    - 5-second pause between failures
+    params = {
+        "series_id": sid,
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "observation_start": "2005-01-01",
+    }
 
-    This is intentionally more tolerant of slow FRED responses
-    when running inside GitHub Actions.
-    """
-
-    url = FRED.format(sid=sid)
+    url = (
+        FRED_API_URL
+        + "?"
+        + urlencode(params)
+    )
 
     last_error = None
 
     for attempt in range(1, 4):
-        try:
-            print(f"Downloading {sid} - attempt {attempt}/3")
 
-            req = Request(
+        try:
+            print(
+                f"Downloading {sid} "
+                f"(attempt {attempt}/3)"
+            )
+
+            request = Request(
                 url,
                 headers={
-                    "User-Agent": "MarketConditionsDashboard/1.0"
+                    "User-Agent":
+                    "MarketConditionsDashboard/1.0"
                 },
             )
 
-            with urlopen(req, timeout=120) as response:
-                raw = response.read().decode("utf-8-sig")
+            with urlopen(
+                request,
+                timeout=60,
+            ) as response:
 
-            reader = csv.DictReader(io.StringIO(raw))
-
-            if not reader.fieldnames:
-                raise ValueError(f"No columns returned for {sid}")
-
-            value_columns = [
-                c
-                for c in reader.fieldnames
-                if c != "observation_date"
-            ]
-
-            if not value_columns:
-                raise ValueError(
-                    f"No value column returned for {sid}"
+                raw = response.read().decode(
+                    "utf-8"
                 )
 
-            value_column = value_columns[0]
+            payload = json.loads(raw)
 
-            output = []
+            if "error_message" in payload:
+                raise RuntimeError(
+                    payload["error_message"]
+                )
 
-            for row in reader:
+            observations = payload.get(
+                "observations",
+                [],
+            )
+
+            rows = []
+
+            for observation in observations:
+
+                value = observation.get(
+                    "value"
+                )
+
+                obs_date = observation.get(
+                    "date"
+                )
+
+                if (
+                    not value
+                    or value == "."
+                    or not obs_date
+                ):
+                    continue
+
                 try:
-                    value_text = row[value_column].strip()
-
-                    if not value_text or value_text == ".":
-                        continue
-
-                    observation_date = date.fromisoformat(
-                        row["observation_date"]
-                    )
-
-                    value = float(value_text)
-
-                    output.append(
+                    rows.append(
                         (
-                            observation_date,
-                            value,
+                            date.fromisoformat(
+                                obs_date
+                            ),
+                            float(value),
                         )
                     )
 
                 except Exception:
                     continue
 
-            output.sort()
+            rows.sort()
 
-            if not output:
-                raise ValueError(
-                    f"No usable observations returned for {sid}"
+            if not rows:
+                raise RuntimeError(
+                    f"No usable data returned "
+                    f"for {sid}"
                 )
 
             print(
-                f"Downloaded {sid}: "
-                f"{len(output)} observations"
+                f"{sid}: "
+                f"{len(rows)} observations"
             )
 
-            return output
+            return rows
 
         except Exception as error:
+
             last_error = error
 
             print(
-                f"Attempt {attempt} failed for {sid}: "
-                f"{error}"
+                f"Attempt {attempt} failed "
+                f"for {sid}: {error}"
             )
 
             if attempt < 3:
-                print("Waiting 5 seconds before retry...")
                 time.sleep(5)
 
     raise RuntimeError(
-        f"Failed to download {sid} after 3 attempts"
+        f"Failed to download "
+        f"{sid} after 3 attempts"
     ) from last_error
 
 
-# ---------------------------------------------------------
+# =========================================================
 # GENERAL HELPERS
-# ---------------------------------------------------------
+# =========================================================
 
 
-def last_before(rows, target_date):
-    """
-    Return the latest observation on or before target_date.
-    """
+def last_before(
+    rows,
+    target_date,
+):
 
     lo = 0
     hi = len(rows)
 
     while lo < hi:
-        mid = (lo + hi) // 2
 
-        if rows[mid][0] <= target_date:
+        mid = (
+            lo + hi
+        ) // 2
+
+        if (
+            rows[mid][0]
+            <= target_date
+        ):
             lo = mid + 1
+
         else:
             hi = mid
 
@@ -296,63 +327,100 @@ def last_before(rows, target_date):
     return rows[lo - 1]
 
 
-def clamp(value, minimum, maximum):
-    return max(minimum, min(maximum, value))
+def clamp(
+    value,
+    minimum,
+    maximum,
+):
+
+    return max(
+        minimum,
+        min(
+            maximum,
+            value,
+        ),
+    )
 
 
 def logistic(z):
-    """
-    Convert standardized values to a smooth 0-100 score.
-    """
 
-    z = clamp(z, -4, 4)
+    z = clamp(
+        z,
+        -4,
+        4,
+    )
 
-    return 100 / (
-        1 + math.exp(-1.12 * z)
+    return (
+        100
+        /
+        (
+            1
+            + math.exp(
+                -1.12 * z
+            )
+        )
     )
 
 
 def robust(values):
-    """
-    Robust center and scale based primarily on median and MAD.
-    """
 
     values = [
         value
         for value in values
-        if value is not None
-        and math.isfinite(value)
+        if (
+            value is not None
+            and math.isfinite(value)
+        )
     ]
 
     if len(values) < 8:
         return 0, 1
 
-    median = statistics.median(values)
+    median = statistics.median(
+        values
+    )
 
     mad = statistics.median(
-        abs(value - median)
+        abs(
+            value - median
+        )
         for value in values
     )
 
     scale = 1.4826 * mad
 
     if scale < 1e-6:
-        scale = statistics.pstdev(values) or 1
 
-    return median, max(scale, 1e-6)
+        scale = (
+            statistics.pstdev(
+                values
+            )
+            or 1
+        )
+
+    return (
+        median,
+        max(
+            scale,
+            1e-6,
+        ),
+    )
 
 
-def yoy(rows, item):
-    """
-    Approximate year-over-year percentage change.
-    """
+def yoy(
+    rows,
+    item,
+):
 
     if not item:
         return None
 
     previous = last_before(
         rows,
-        item[0] - timedelta(days=365),
+        item[0]
+        - timedelta(
+            days=365
+        ),
     )
 
     if not previous:
@@ -362,13 +430,17 @@ def yoy(rows, item):
         return None
 
     return (
-        item[1] / previous[1] - 1
+        (
+            item[1]
+            / previous[1]
+        )
+        - 1
     ) * 100
 
 
-# ---------------------------------------------------------
-# ECONOMIC MODEL
-# ---------------------------------------------------------
+# =========================================================
+# ECONOMIC COMPONENT SCORING
+# =========================================================
 
 
 def econ_component(
@@ -376,16 +448,27 @@ def econ_component(
     asof,
     rows,
 ):
-    name, detail, weight, kind, lag_days = ECON[sid]
+
+    (
+        name,
+        detail,
+        weight,
+        kind,
+        lag_days,
+    ) = ECON[sid]
 
     current = last_before(
         rows,
-        asof - timedelta(days=lag_days),
+        asof
+        - timedelta(
+            days=lag_days
+        ),
     )
 
     previous = last_before(
         rows,
-        asof - timedelta(
+        asof
+        - timedelta(
             days=lag_days + 92
         ),
     )
@@ -393,11 +476,13 @@ def econ_component(
     if not current:
         return None
 
-    # ---------------------------------------------
-    # NORMAL GROWTH SERIES
-    # ---------------------------------------------
+
+    # -----------------------------------------------------
+    # GROWTH VARIABLES
+    # -----------------------------------------------------
 
     if kind == "growth":
+
         current_growth = yoy(
             rows,
             current,
@@ -408,30 +493,35 @@ def econ_component(
             previous,
         )
 
-        historical_growth = []
-
         history_start = (
-            asof - timedelta(days=3650)
+            asof
+            - timedelta(
+                days=3650
+            )
         )
 
+        history = []
+
         for item in rows:
+
             if (
                 history_start
                 <= item[0]
                 <= current[0]
             ):
+
                 growth = yoy(
                     rows,
                     item,
                 )
 
                 if growth is not None:
-                    historical_growth.append(
+                    history.append(
                         growth
                     )
 
         median, scale = robust(
-            historical_growth
+            history
         )
 
         if current_growth is None:
@@ -439,29 +529,40 @@ def econ_component(
 
         level_score = logistic(
             (
-                current_growth - median
+                current_growth
+                - median
             )
-            / max(scale, 0.25)
+            /
+            max(
+                scale,
+                0.25,
+            )
         )
 
         if previous_growth is None:
+
             acceleration_score = 50
 
         else:
+
             acceleration_score = logistic(
                 (
                     current_growth
                     - previous_growth
                 )
-                / max(
+                /
+                max(
                     scale * 0.5,
                     0.35,
                 )
             )
 
         score = (
-            0.68 * level_score
-            + 0.32 * acceleration_score
+            0.68
+            * level_score
+            +
+            0.32
+            * acceleration_score
         )
 
         epsilon = max(
@@ -470,28 +571,36 @@ def econ_component(
         )
 
         if previous_growth is None:
+
             direction = "→"
 
         elif (
             current_growth
-            > previous_growth + epsilon
+            > previous_growth
+            + epsilon
         ):
+
             direction = "↑"
 
         elif (
             current_growth
-            < previous_growth - epsilon
+            < previous_growth
+            - epsilon
         ):
+
             direction = "↓"
 
         else:
+
             direction = "→"
 
-    # ---------------------------------------------
-    # INFLATION SERIES
-    # ---------------------------------------------
+
+    # -----------------------------------------------------
+    # INFLATION
+    # -----------------------------------------------------
 
     elif kind == "inflation":
+
         current_growth = yoy(
             rows,
             current,
@@ -512,17 +621,23 @@ def econ_component(
         level_score = (
             100
             - clamp(
-                current_distance / 5 * 100,
+                (
+                    current_distance
+                    / 5
+                )
+                * 100,
                 0,
                 100,
             )
         )
 
         if previous_growth is None:
+
             direction_score = 50
             direction = "→"
 
         else:
+
             previous_distance = abs(
                 previous_growth - 2
             )
@@ -533,75 +648,111 @@ def econ_component(
             )
 
             direction_score = logistic(
-                improvement / 0.45
+                improvement
+                / 0.45
             )
 
             if (
                 current_distance
-                < previous_distance - 0.08
+                < previous_distance
+                - 0.08
             ):
+
                 direction = "↑"
 
             elif (
                 current_distance
-                > previous_distance + 0.08
+                > previous_distance
+                + 0.08
             ):
+
                 direction = "↓"
 
             else:
+
                 direction = "→"
 
         score = (
-            0.72 * level_score
-            + 0.28 * direction_score
+            0.72
+            * level_score
+            +
+            0.28
+            * direction_score
         )
 
-    # ---------------------------------------------
-    # FEDERAL FUNDS POLICY RATE
-    # ---------------------------------------------
+
+    # -----------------------------------------------------
+    # POLICY RATE
+    # -----------------------------------------------------
 
     elif kind == "policy":
+
         rate = current[1]
 
-        if previous:
-            previous_rate = previous[1]
-        else:
-            previous_rate = rate
+        previous_rate = (
+            previous[1]
+            if previous
+            else rate
+        )
 
         level_score = logistic(
-            (2.5 - rate) / 1.8
+            (
+                2.5 - rate
+            )
+            / 1.8
         )
 
         direction_score = logistic(
             (
-                previous_rate - rate
+                previous_rate
+                - rate
             )
             / 0.65
         )
 
         score = (
-            0.70 * level_score
-            + 0.30 * direction_score
+            0.70
+            * level_score
+            +
+            0.30
+            * direction_score
         )
 
-        if rate < previous_rate - 0.10:
+        if (
+            rate
+            < previous_rate
+            - 0.10
+        ):
+
             direction = "↑"
 
-        elif rate > previous_rate + 0.10:
+        elif (
+            rate
+            > previous_rate
+            + 0.10
+        ):
+
             direction = "↓"
 
         else:
+
             direction = "→"
 
     else:
+
         return None
+
 
     return {
         "name": name,
         "detail": detail,
         "weight": weight,
         "score": round(
-            clamp(score, 0, 100),
+            clamp(
+                score,
+                0,
+                100,
+            ),
             1,
         ),
         "direction": direction,
@@ -612,12 +763,14 @@ def econ_score(
     asof,
     series,
 ):
+
     parts = []
 
     numerator = 0
     denominator = 0
 
     for sid in ECON:
+
         component = econ_component(
             sid,
             asof,
@@ -625,29 +778,38 @@ def econ_score(
         )
 
         if component:
-            parts.append(component)
+
+            parts.append(
+                component
+            )
 
             numerator += (
                 component["score"]
-                * component["weight"]
+                *
+                component["weight"]
             )
 
             denominator += (
                 component["weight"]
             )
 
-    if not denominator:
-        return None, []
+    if denominator == 0:
+
+        return (
+            None,
+            [],
+        )
 
     return (
-        numerator / denominator,
+        numerator
+        / denominator,
         parts,
     )
 
 
-# ---------------------------------------------------------
-# SENTIMENT MODEL
-# ---------------------------------------------------------
+# =========================================================
+# SENTIMENT SCORING
+# =========================================================
 
 
 def window_values(
@@ -655,16 +817,26 @@ def window_values(
     asof,
     days=3650,
 ):
+
     start = (
-        asof - timedelta(days=days)
+        asof
+        - timedelta(
+            days=days
+        )
     )
 
     return [
         value
-        for observation_date, value in rows
-        if start
-        <= observation_date
-        <= asof
+        for (
+            observation_date,
+            value,
+        )
+        in rows
+        if (
+            start
+            <= observation_date
+            <= asof
+        )
     ]
 
 
@@ -673,7 +845,13 @@ def sent_component(
     asof,
     rows,
 ):
-    name, detail, weight, kind = SENT[sid]
+
+    (
+        name,
+        detail,
+        weight,
+        kind,
+    ) = SENT[sid]
 
     current = last_before(
         rows,
@@ -683,63 +861,85 @@ def sent_component(
     if not current:
         return None
 
-    # ---------------------------------------------
-    # MARKET MOMENTUM
-    # ---------------------------------------------
+
+    # -----------------------------------------------------
+    # MOMENTUM
+    # -----------------------------------------------------
 
     if kind == "momentum":
+
         one_month_ago = last_before(
             rows,
-            asof - timedelta(days=30),
+            asof
+            - timedelta(
+                days=30
+            ),
         )
 
         one_week_ago = last_before(
             rows,
-            asof - timedelta(days=7),
+            asof
+            - timedelta(
+                days=7
+            ),
         )
 
         if not one_month_ago:
             return None
 
         return_1m = (
-            current[1]
-            / one_month_ago[1]
+            (
+                current[1]
+                / one_month_ago[1]
+            )
             - 1
         ) * 100
 
         if one_week_ago:
+
             return_1w = (
-                current[1]
-                / one_week_ago[1]
+                (
+                    current[1]
+                    / one_week_ago[1]
+                )
                 - 1
             ) * 100
 
         else:
+
             return_1w = return_1m
 
-        combined_momentum = (
-            0.7 * return_1m
-            + 0.3 * return_1w
+        combined = (
+            0.7
+            * return_1m
+            +
+            0.3
+            * return_1w
         )
 
         score = logistic(
-            combined_momentum / 4
+            combined / 4
         )
 
         if return_1w > 1:
+
             direction = "↑"
 
         elif return_1w < -1:
+
             direction = "↓"
 
         else:
+
             direction = "→"
 
-    # ---------------------------------------------
-    # FEAR / STRESS MEASURES
-    # ---------------------------------------------
+
+    # -----------------------------------------------------
+    # STRESS / FEAR INDICATORS
+    # -----------------------------------------------------
 
     else:
+
         values = window_values(
             rows,
             asof,
@@ -750,24 +950,32 @@ def sent_component(
         )
 
         z = (
-            current[1] - median
+            current[1]
+            - median
         ) / max(
             scale,
             0.01,
         )
 
-        # Higher VIX/spreads/stress = worse sentiment.
-        score = 100 - logistic(z)
+        score = (
+            100
+            - logistic(z)
+        )
 
         one_month_ago = last_before(
             rows,
-            asof - timedelta(days=30),
+            asof
+            - timedelta(
+                days=30
+            ),
         )
 
         if not one_month_ago:
+
             direction = "→"
 
         else:
+
             delta = (
                 current[1]
                 - one_month_ago[1]
@@ -779,20 +987,28 @@ def sent_component(
             )
 
             if delta < -epsilon:
+
                 direction = "↑"
 
             elif delta > epsilon:
+
                 direction = "↓"
 
             else:
+
                 direction = "→"
+
 
     return {
         "name": name,
         "detail": detail,
         "weight": weight,
         "score": round(
-            clamp(score, 0, 100),
+            clamp(
+                score,
+                0,
+                100,
+            ),
             1,
         ),
         "direction": direction,
@@ -803,12 +1019,14 @@ def sent_score(
     asof,
     series,
 ):
+
     parts = []
 
     numerator = 0
     denominator = 0
 
     for sid in SENT:
+
         component = sent_component(
             sid,
             asof,
@@ -816,32 +1034,42 @@ def sent_score(
         )
 
         if component:
-            parts.append(component)
+
+            parts.append(
+                component
+            )
 
             numerator += (
                 component["score"]
-                * component["weight"]
+                *
+                component["weight"]
             )
 
             denominator += (
                 component["weight"]
             )
 
-    if not denominator:
-        return None, []
+    if denominator == 0:
+
+        return (
+            None,
+            [],
+        )
 
     return (
-        numerator / denominator,
+        numerator
+        / denominator,
         parts,
     )
 
 
-# ---------------------------------------------------------
-# LABELS
-# ---------------------------------------------------------
+# =========================================================
+# CLASSIFICATION
+# =========================================================
 
 
 def econ_class(score):
+
     if score >= 80:
         return "Exceptional"
 
@@ -868,6 +1096,7 @@ def direction(
     previous,
     epsilon=1.5,
 ):
+
     if current > previous + epsilon:
         return "↑"
 
@@ -877,23 +1106,54 @@ def direction(
     return "→"
 
 
-# ---------------------------------------------------------
+# =========================================================
 # MAIN
-# ---------------------------------------------------------
+# =========================================================
 
 
 def main():
-    ids = set(ECON) | set(SENT)
+
+    print("")
+    print(
+        "========================================"
+    )
+    print(
+        "Market Conditions Dashboard"
+    )
+    print(
+        "========================================"
+    )
+
+    if not FRED_API_KEY:
+
+        raise RuntimeError(
+            "FRED_API_KEY was not passed "
+            "to the workflow."
+        )
+
+    ids = sorted(
+        set(ECON)
+        | set(SENT)
+    )
 
     series = {}
 
-    print("")
-    print("========================================")
-    print("Downloading FRED data")
-    print("========================================")
 
-    for sid in sorted(ids):
-        series[sid] = fetch(sid)
+    # -----------------------------------------------------
+    # DOWNLOAD
+    # -----------------------------------------------------
+
+    print("")
+    print(
+        "Downloading FRED series..."
+    )
+
+    for sid in ids:
+
+        series[sid] = fetch(
+            sid
+        )
+
 
     today = date.today()
 
@@ -906,26 +1166,36 @@ def main():
         )
     )
 
+
+    # -----------------------------------------------------
+    # BUILD 10-YEAR HISTORY
+    # -----------------------------------------------------
+
     print("")
-    print("========================================")
-    print("Building 10-year history")
-    print("========================================")
+    print(
+        "Building 10-year history..."
+    )
 
     history = []
 
     current_date = start
 
     while current_date <= today:
+
         if current_date.weekday() < 5:
 
-            economic_score, _ = econ_score(
-                current_date,
-                series,
+            economic_score, _ = (
+                econ_score(
+                    current_date,
+                    series,
+                )
             )
 
-            sentiment_score, _ = sent_score(
-                current_date,
-                series,
+            sentiment_score, _ = (
+                sent_score(
+                    current_date,
+                    series,
+                )
             )
 
             sp500 = last_before(
@@ -934,9 +1204,12 @@ def main():
             )
 
             if (
-                economic_score is not None
-                and sentiment_score is not None
+                economic_score
+                is not None
+                and sentiment_score
+                is not None
             ):
+
                 history.append(
                     {
                         "date":
@@ -966,44 +1239,64 @@ def main():
                     }
                 )
 
-        current_date += timedelta(days=1)
+        current_date += timedelta(
+            days=1
+        )
+
 
     print(
-        f"Built {len(history)} "
-        f"historical observations"
+        f"Historical rows: "
+        f"{len(history)}"
     )
 
-    # -------------------------------------------------
+
+    # -----------------------------------------------------
     # CURRENT ECONOMIC SCORE
-    # -------------------------------------------------
+    # -----------------------------------------------------
 
-    economic_score, economic_parts = econ_score(
-        today,
-        series,
+    economic_score, economic_parts = (
+        econ_score(
+            today,
+            series,
+        )
     )
 
-    economic_3m, _ = econ_score(
-        today - timedelta(days=92),
-        series,
+    economic_3m, _ = (
+        econ_score(
+            today
+            - timedelta(
+                days=92
+            ),
+            series,
+        )
     )
 
-    # -------------------------------------------------
+
+    # -----------------------------------------------------
     # CURRENT SENTIMENT SCORE
-    # -------------------------------------------------
+    # -----------------------------------------------------
 
-    sentiment_score, sentiment_parts = sent_score(
-        today,
-        series,
+    sentiment_score, sentiment_parts = (
+        sent_score(
+            today,
+            series,
+        )
     )
 
-    sentiment_1m, _ = sent_score(
-        today - timedelta(days=30),
-        series,
+    sentiment_1m, _ = (
+        sent_score(
+            today
+            - timedelta(
+                days=30
+            ),
+            series,
+        )
     )
 
-    # -------------------------------------------------
-    # CURRENT S&P VALUE
-    # -------------------------------------------------
+
+    # -----------------------------------------------------
+    # CURRENT S&P 500
+    # -----------------------------------------------------
 
     sp500_current = last_before(
         series["SP500"],
@@ -1012,27 +1305,37 @@ def main():
 
     sp500_1m = last_before(
         series["SP500"],
-        today - timedelta(days=30),
+        today
+        - timedelta(
+            days=30
+        ),
     )
+
 
     if (
         sp500_current
         and sp500_1m
     ):
+
         sp500_change = (
-            sp500_current[1]
-            / sp500_1m[1]
+            (
+                sp500_current[1]
+                / sp500_1m[1]
+            )
             - 1
         ) * 100
 
     else:
+
         sp500_change = None
 
-    # -------------------------------------------------
-    # JSON PAYLOAD
-    # -------------------------------------------------
+
+    # -----------------------------------------------------
+    # OUTPUT JSON
+    # -----------------------------------------------------
 
     payload = {
+
         "generated_at":
             datetime.now(
                 timezone.utc
@@ -1041,7 +1344,9 @@ def main():
             ),
 
         "current": {
+
             "economic": {
+
                 "score":
                     round(
                         economic_score,
@@ -1070,7 +1375,9 @@ def main():
                     economic_parts,
             },
 
+
             "sentiment": {
+
                 "score":
                     round(
                         sentiment_score,
@@ -1094,7 +1401,9 @@ def main():
                     sentiment_parts,
             },
 
+
             "sp500": {
+
                 "value":
                     (
                         None
@@ -1108,7 +1417,8 @@ def main():
                 "change_1m":
                     (
                         None
-                        if sp500_change is None
+                        if sp500_change
+                        is None
                         else round(
                             sp500_change,
                             2,
@@ -1117,11 +1427,15 @@ def main():
             },
         },
 
+
         "history":
             history,
 
+
         "meta": {
-            "history_years": 10,
+
+            "history_years":
+                10,
 
             "economic_model_uses_market_data":
                 False,
@@ -1131,8 +1445,12 @@ def main():
 
             "sp500_is_display_only":
                 True,
+
+            "fred_source":
+                "Official FRED API",
         },
     }
+
 
     OUT.parent.mkdir(
         parents=True,
@@ -1142,22 +1460,37 @@ def main():
     OUT.write_text(
         json.dumps(
             payload,
-            separators=(",", ":"),
+            separators=(
+                ",",
+                ":",
+            ),
         )
     )
 
+
     print("")
-    print("========================================")
-    print("Dashboard data generated successfully")
-    print("========================================")
-    print(f"Output: {OUT}")
+    print(
+        "========================================"
+    )
+    print(
+        "SUCCESS"
+    )
+    print(
+        "========================================"
+    )
+
     print(
         f"Economic score: "
         f"{economic_score:.1f}"
     )
+
     print(
         f"Sentiment score: "
         f"{sentiment_score:.1f}"
+    )
+
+    print(
+        f"Saved to: {OUT}"
     )
 
 
