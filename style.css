@@ -15,6 +15,9 @@
 * {
   box-sizing: border-box;
 }
+html {
+  background: linear-gradient(180deg, #090c10, #0c1015);
+}
 body {
   margin: 0;
   background: linear-gradient(180deg, #090c10, #0c1015);
