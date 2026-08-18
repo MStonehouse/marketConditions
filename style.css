@@ -16,7 +16,8 @@
   box-sizing: border-box;
 }
 html {
-  background: linear-gradient(180deg, #090c10, #0c1015);
+  background: #0a0d11;
+  min-height: 100%;
 }
 body {
   margin: 0;
